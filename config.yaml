@@ -1,0 +1,17 @@
+paths:
+  dataset: dataset/data.yaml
+  models: models
+
+training:
+  batch: 8
+  imgsz: 640
+  epochs: 50
+  model_name: yolo11s.pt
+
+inference:
+  conf_threshold: 0.25
+  iou_threshold: 0.7
+  device: 0
+
+hardware:
+  model_type: yolo11s
