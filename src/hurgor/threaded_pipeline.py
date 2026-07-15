@@ -1,42 +1,76 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
+import os
 import queue
+import random
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol
 from urllib.parse import urljoin
 
 import httpx
+import cv2
+import numpy as np
 
-from .client import CompetitionAPI, PermanentAPIError, RetryExhausted, SessionComplete
+from .client import (
+    AuthenticationManager,
+    CompetitionAPI,
+    PermanentAPIError,
+    RetryExhausted,
+    SessionComplete,
+    build_http_auth_async,
+)
 from .config import ClientSettings
-from .inference import PipelineInferenceEngine
+from .inference import InferenceOutcome, PipelineInferenceEngine
+from .metrics import FrameMetric, MetricsCollector, current_rss_mb
+from .modality import frame_modality as _frame_modality
 from .models import DetectedTranslation, FrameMetadata, Prediction
+from .references import ReferenceManager
+from .logging_utils import configure_logging
+from .vision import HurgorVision
+from .watchdog import InferenceTimeoutError, InferenceWatchdog, InferenceWorkerError
 
 LOGGER = logging.getLogger("hurgor.pipeline")
 _SENTINEL = object()
+_CALIBRATION_FRAME_LIMIT = 450
+_GPS_DENIED_FRAME = 1000
+_GPS_NOISE_STD_M = 0.75
+_DRIFT_ALERT_SCORE = 6.0
+_DRIFT_RECOVERY_SCORE = 2.0
+_DRIFT_SPEED_ALERT_MPS = 35.0
+_FLOW_METERS_PER_PIXEL = 0.04
+_TRAJECTORY_MAP_PATH = "trajectory_map.json"
 
 
 @dataclass(frozen=True, slots=True)
 class FrameJob:
     frame: FrameMetadata
+    frame_index: int
+    calibration_phase: bool
     image_bytes: bytes
-    received_at: float
-    network_in_ms: float
+    cycle_started_at: float
+    timings_ms: dict[str, float]
+    network_counts: dict[str, float]
 
 
 @dataclass(frozen=True, slots=True)
 class ResultJob:
     prediction: Prediction
     frame_url: str
-    received_at: float
-    network_in_ms: float
-    inference_ms: float
+    frame_index: int
+    calibration_phase: bool
+    modality: str
+    cycle_started_at: float
+    timings_ms: dict[str, float]
     degraded: bool
+    fallback: bool
+    network_counts: dict[str, float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,13 +80,28 @@ class FrameAck:
 
 @dataclass(slots=True)
 class ThreadedPipelineStats:
+    frames_processed: int = 0
     frames_submitted: int = 0
+    calibration_frames: int = 0
+    inference_frames: int = 0
     fetch_errors: int = 0
     image_errors: int = 0
+    corrupt_frame_errors: int = 0
     inference_errors: int = 0
     post_errors: int = 0
     sla_misses: int = 0
     degraded_frames: int = 0
+    fallback_frames: int = 0
+    inference_timeouts: int = 0
+    model_restarts: int = 0
+    odometry_state_restores: int = 0
+    inference_circuit_breaker_trips: int = 0
+    inference_bypass_frames: int = 0
+    position_extrapolation_fallbacks: int = 0
+    retry_count: int = 0
+    http_401_count: int = 0
+    http_429_count: int = 0
+    http_5xx_count: int = 0
     fatal_error: str | None = None
     started_at: float = field(default_factory=time.monotonic)
     recent_latencies_ms: list[float] = field(default_factory=list)
@@ -98,45 +147,82 @@ class NetworkGateway(Protocol):
     def close(self) -> None: ...
 
 
-class _AsyncioRunnerCompat:
-    def __init__(self) -> None:
-        self.loop = asyncio.new_event_loop()
-
-    def run(self, coro: Any) -> Any:
-        return self.loop.run_until_complete(coro)
-
-    def close(self) -> None:
-        self.loop.close()
-
-
 class AsyncioHTTPGateway:
     """Owns one asyncio loop and one AsyncClient inside a network thread."""
 
-    def __init__(self, settings: ClientSettings) -> None:
+    def __init__(
+        self,
+        settings: ClientSettings,
+        *,
+        auth_manager: AuthenticationManager | None = None,
+        reconcile: bool = False,
+        reference_manager: ReferenceManager | None = None,
+    ) -> None:
         self.settings = settings
-        self.runner: Any
-        try:
-            self.runner = asyncio.Runner()
-        except AttributeError:
-            self.runner = _AsyncioRunnerCompat()
+        self.auth_manager = auth_manager
+        self.reconcile = reconcile
+        self.reference_manager = reference_manager
+        self.runner = asyncio.Runner()
         self.client = self.runner.run(self._create_client())
-        self.api = CompetitionAPI(settings, self.client)
+        self.api = CompetitionAPI(settings, self.client, auth_manager)
+        self._reported_retries = 0
+        self._reported_status_counts: dict[int, int] = {}
+        if reconcile:
+            self.runner.run(self._reconcile())
 
     async def _create_client(self) -> httpx.AsyncClient:
+        if self.auth_manager is not None:
+            token = await asyncio.to_thread(self.auth_manager.token)
+            return httpx.AsyncClient(
+                base_url=self.settings.base_url,
+                headers={"Authorization": f"Token {token}"},
+                timeout=httpx.Timeout(self.settings.http_timeout_seconds),
+                limits=httpx.Limits(max_connections=2, max_keepalive_connections=2),
+            )
         return httpx.AsyncClient(
             base_url=self.settings.base_url,
+            auth=await build_http_auth_async(self.settings),
             timeout=httpx.Timeout(self.settings.http_timeout_seconds),
             limits=httpx.Limits(max_connections=2, max_keepalive_connections=2),
         )
 
+    async def _reconcile(self) -> None:
+        progress = await self.api.fetch_progress()
+        LOGGER.info("state_reconciled progress_type=%s", type(progress).__name__)
+        if self.reference_manager is not None:
+            await self.reference_manager.bootstrap(self.api)
+
     def fetch_frame(self) -> FrameMetadata:
-        return self.runner.run(self.api.fetch_frame())
+        frame = self.runner.run(self.api.fetch_frame())
+        self.last_fetch_timings_ms = dict(self.api.last_fetch_timings_ms)
+        return frame
 
     def fetch_image(self, image_url: str) -> bytes:
         return self.runner.run(self.api.fetch_image(image_url))
 
     def submit(self, prediction: Prediction) -> None:
         self.runner.run(self.api.submit(prediction))
+
+    def take_telemetry(self) -> dict[str, float]:
+        retries = self.api.retry_count - self._reported_retries
+        self._reported_retries = self.api.retry_count
+        deltas: dict[int, int] = {}
+        for status, count in self.api.status_counts.items():
+            previous = self._reported_status_counts.get(status, 0)
+            deltas[status] = count - previous
+        self._reported_status_counts = dict(self.api.status_counts)
+        auth_ms = 0.0
+        if self.auth_manager is not None:
+            auth_ms = self.auth_manager.take_auth_ms()
+        return {
+            "retry_count": retries,
+            "http_401_count": deltas.get(401, 0),
+            "http_429_count": deltas.get(429, 0),
+            "http_5xx_count": sum(
+                count for status, count in deltas.items() if 500 <= status <= 599
+            ),
+            "auth_ms": auth_ms,
+        }
 
     def close(self) -> None:
         try:
@@ -174,6 +260,55 @@ class DegradationController:
                 changed = True
         return changed
 
+    def force_degraded(self) -> bool:
+        if self.degraded:
+            self._fast_streak = 0
+            return False
+        self.degraded = True
+        self._slow_streak = 0
+        self._fast_streak = 0
+        return True
+
+
+@dataclass(slots=True)
+class InferenceCircuitBreaker:
+    """Bound restart storms while keeping the one-GET/one-POST protocol alive."""
+
+    failure_threshold: int = 2
+    cooldown_frames: int = 30
+    consecutive_timeouts: int = 0
+    remaining_bypass_frames: int = 0
+    trip_count: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def is_open(self) -> bool:
+        with self._lock:
+            return self.remaining_bypass_frames > 0
+
+    def record_timeout(self) -> bool:
+        """Return True only when this timeout opens the circuit."""
+
+        with self._lock:
+            self.consecutive_timeouts += 1
+            if self.consecutive_timeouts < self.failure_threshold:
+                return False
+            self.consecutive_timeouts = 0
+            self.remaining_bypass_frames = self.cooldown_frames
+            self.trip_count += 1
+            return True
+
+    def record_success(self) -> None:
+        with self._lock:
+            self.consecutive_timeouts = 0
+
+    def consume_bypass(self) -> bool:
+        with self._lock:
+            if self.remaining_bypass_frames <= 0:
+                return False
+            self.remaining_bypass_frames -= 1
+            return True
+
 
 GatewayFactory = Callable[[str], NetworkGateway]
 
@@ -188,9 +323,43 @@ class ThreadedEdgePipeline:
         inference: PipelineInferenceEngine | None = None,
         gateway_factory: GatewayFactory | None = None,
     ) -> None:
+        if settings.is_official and settings.reference_endpoint:
+            # Committee-provided dynamic references must not overwrite training data.
+            settings = replace(settings, reference_images_dir=settings.reference_cache_dir)
         self.settings = settings
-        self.inference = inference or PipelineInferenceEngine.from_settings(settings)
-        self.gateway_factory = gateway_factory or (lambda _role: AsyncioHTTPGateway(settings))
+        self._owns_inference = inference is None
+        self.watchdog = (
+            InferenceWatchdog(settings)
+            if inference is None and settings.inference_process_enabled
+            else None
+        )
+        self.inference = (
+            inference
+            if inference is not None
+            else PipelineInferenceEngine()
+            if self.watchdog is not None
+            else PipelineInferenceEngine.from_settings(settings)
+        )
+        self.auth_manager = (
+            AuthenticationManager(settings)
+            if settings.is_official and settings.auth_scheme not in {"none", "off", "disabled"}
+            else None
+        )
+        self.reference_manager = (
+            ReferenceManager(settings.reference_images_dir)
+            if settings.is_official
+            and settings.reference_endpoint
+            and settings.reference_images_dir
+            else None
+        )
+        self.gateway_factory = gateway_factory or (
+            lambda role: AsyncioHTTPGateway(
+                settings,
+                auth_manager=self.auth_manager,
+                reconcile=role == "producer",
+                reference_manager=self.reference_manager if role == "producer" else None,
+            )
+        )
         self.input_queue: queue.Queue[FrameJob | object] = queue.Queue(
             maxsize=settings.queue_maxsize
         )
@@ -207,8 +376,42 @@ class ThreadedEdgePipeline:
             recover_threshold_ms=settings.recover_threshold_ms,
             fast_frames_to_recover=settings.recover_after_frames,
         )
+        self.inference_circuit_breaker = InferenceCircuitBreaker(
+            failure_threshold=settings.inference_circuit_breaker_threshold,
+            cooldown_frames=settings.inference_circuit_breaker_cooldown_frames,
+        )
         self.threads: list[threading.Thread] = []
         self.max_frames: int | None = None
+        self.metrics = MetricsCollector.from_path(settings.metrics_file)
+        # The inference process owns model state, but the parent must retain the last
+        # finite translation so a child crash during a GPS outage cannot jump to origin.
+        self._last_safe_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._last_safe_delta: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._safe_position_initialized = False
+        self._safe_stream_key: tuple[str, str] | None = None
+        self._parent_fallback_steps = 0
+        self._gps_denied_frame = max(
+            1,
+            int(os.getenv("HURGOR_GPS_DENIED_FRAME", str(_GPS_DENIED_FRAME))),
+        )
+        self._gps_noise_std_m = max(
+            0.0,
+            float(os.getenv("HURGOR_GPS_NOISE_STD_M", str(_GPS_NOISE_STD_M))),
+        )
+        self._rng = random.Random(
+            int(os.getenv("HURGOR_GPS_NOISE_SEED", "2026"))
+        )
+        self._origin_locked = False
+        self._gps_denied_mode = False
+        self._gps_denied_announced = False
+        self._relative_position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._relative_velocity: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._previous_gray_frame: np.ndarray | None = None
+        self._last_nav_timestamp: float | None = None
+        self._drift_score = 0.0
+        self._graceful_nav_degraded = False
+        self.map_data: list[dict[str, object]] = []
+        self._map_lock = threading.Lock()
 
     @property
     def thread_names(self) -> tuple[str, ...]:
@@ -249,6 +452,14 @@ class ThreadedEdgePipeline:
             self.stats.set_fatal(message)
             LOGGER.error(message)
             self.stop()
+        if self.watchdog is not None:
+            self.watchdog.close()
+            self.stats.model_restarts = self.watchdog.restart_count
+            self.stats.odometry_state_restores = int(
+                getattr(self.watchdog, "state_restore_count", 0)
+            )
+        self._save_trajectory_map()
+        LOGGER.info("metrics_summary %s", json.dumps(self.metrics.summary(), sort_keys=True))
         return self.stats
 
     def stop(self) -> None:
@@ -260,10 +471,57 @@ class ThreadedEdgePipeline:
         gateway: NetworkGateway | None = None
         try:
             gateway = self.gateway_factory("producer")
+            if (
+                self._owns_inference
+                and self.watchdog is None
+                and self.reference_manager is not None
+                and self.reference_manager.assets
+            ):
+                self.inference = PipelineInferenceEngine.from_settings(self.settings)
+                LOGGER.info(
+                    "in_process_inference_reloaded_after_references references=%d",
+                    len(self.reference_manager.assets),
+                )
+            if self.watchdog is not None:
+                started = time.perf_counter()
+                try:
+                    # Reconciliation downloads dynamic references first. Warm the worker
+                    # only after that, but still before requesting the first frame.
+                    self.watchdog.start()
+                    LOGGER.info(
+                        "inference_worker_prewarmed startup_ms=%.3f",
+                        (time.perf_counter() - started) * 1000,
+                    )
+                except InferenceWorkerError as exc:
+                    # Keep the protocol alive with fallback packets. The watchdog has
+                    # launched a fresh child and retries readiness on the first job.
+                    LOGGER.error("inference_worker_prestart_failed error=%s", exc)
             while not self.stop_event.is_set():
                 if self._limit_reached():
                     self._put(self.input_queue, _SENTINEL)
                     return
+                if (
+                    self.watchdog is not None
+                    and not self.watchdog.ready
+                    and not self.inference_circuit_breaker.is_open
+                ):
+                    started = time.perf_counter()
+                    try:
+                        # A timed-out native worker is restarted immediately so the
+                        # current frame can receive a fallback response. Wait for that
+                        # replacement here, between protocol credits, before fetching
+                        # the next competition frame. Startup time must never be charged
+                        # to a frame that is already outstanding on the server.
+                        self.watchdog.start()
+                        LOGGER.info(
+                            "inference_worker_ready_before_fetch startup_ms=%.3f",
+                            (time.perf_counter() - started) * 1000,
+                        )
+                    except InferenceWorkerError as exc:
+                        # A permanently broken model must not stop the protocol. The
+                        # worker loop will still build and POST a schema-valid fallback.
+                        LOGGER.error("inference_worker_not_ready_before_fetch error=%s", exc)
+                cycle_started = time.monotonic()
                 started = time.perf_counter()
                 try:
                     frame = gateway.fetch_frame()
@@ -279,31 +537,54 @@ class ThreadedEdgePipeline:
                     self._fatal(f"permanent Network IN error: {exc}")
                     return
                 configured_session = self._absolute_session_url()
-                if frame.session != configured_session:
+                if self.settings.api_contract != "official" and frame.session != configured_session:
                     LOGGER.warning(
                         "session_mismatch configured=%s received=%s",
                         configured_session,
                         frame.session,
                     )
 
+                frame_metadata_ms = (time.perf_counter() - started) * 1000
+                frame_index = _frame_index_from_url(frame.url)
+                frame = self._simulate_gps_stream(frame, frame_index)
+                calibration_phase = frame_index <= _CALIBRATION_FRAME_LIMIT
+                phase_label = "[CALIBRATION_PHASE]" if calibration_phase else "[INFERENCE_PHASE]"
+                LOGGER.info(
+                    "%s frame=%s index=%d", phase_label, frame.url, frame_index
+                )
+                fetch_timings = getattr(gateway, "last_fetch_timings_ms", {})
+                image_started = time.perf_counter()
                 try:
                     image_bytes = gateway.fetch_image(frame.image_url)
                 except (RetryExhausted, PermanentAPIError) as exc:
                     self.stats.increment("image_errors")
                     LOGGER.warning("image_fallback frame=%s error=%s", frame.url, exc)
                     image_bytes = b""
-                network_ms = (time.perf_counter() - started) * 1000
-                LOGGER.info(
-                    "network_in frame=%s elapsed_ms=%.3f bytes=%d",
-                    frame.url,
-                    network_ms,
-                    len(image_bytes),
+                image_download_ms = (time.perf_counter() - image_started) * 1000
+                network_counts = _gateway_telemetry(gateway)
+                self._record_network_counts(network_counts)
+                job = FrameJob(
+                    frame,
+                    frame_index,
+                    calibration_phase,
+                    image_bytes,
+                    cycle_started,
+                    {
+                        "auth_ms": network_counts.pop("auth_ms", 0.0),
+                        "frame_metadata_ms": fetch_timings.get(
+                            "frame_metadata_ms", frame_metadata_ms
+                        ),
+                        "translation_ms": fetch_timings.get("translation_ms", 0.0),
+                        "image_download_ms": image_download_ms,
+                    },
+                    network_counts,
                 )
-                job = FrameJob(frame, image_bytes, time.monotonic(), network_ms)
                 if not self._put(self.input_queue, job):
                     return
                 if not self._wait_for_ack(frame.url):
                     return
+                if not self._limit_reached():
+                    self._pace(cycle_started)
         except Exception as exc:
             LOGGER.exception("producer_unhandled error=%s", exc)
             self._fatal(f"producer failed: {exc}")
@@ -326,19 +607,85 @@ class ThreadedEdgePipeline:
                     assert isinstance(item, FrameJob)
                     started = time.perf_counter()
                     degraded = self.degradation.degraded
+                    fallback = False
                     try:
-                        prediction = self.inference.infer(
-                            item.frame,
-                            item.image_bytes,
-                            self._absolute_user_url(),
-                            degraded=degraded,
+                        if (
+                            self.watchdog is not None
+                            and self.inference_circuit_breaker.consume_bypass()
+                        ):
+                            self.stats.increment("fallback_frames")
+                            self.stats.increment("inference_bypass_frames")
+                            fallback = True
+                            prediction = self._emergency_prediction(item.frame)
+                            outcome = InferenceOutcome(prediction, {})
+                        elif self.watchdog is not None:
+                            outcome = self.watchdog.infer_timed(
+                                item.frame,
+                                item.image_bytes,
+                                self._absolute_user_url(),
+                                degraded=degraded,
+                            )
+                        else:
+                            outcome = self.inference.infer_timed(
+                                item.frame,
+                                item.image_bytes,
+                                self._absolute_user_url(),
+                                degraded=degraded,
+                            )
+                        prediction = outcome.prediction
+                        prediction = self._apply_navigation_mode(item, prediction)
+                        self._remember_safe_position(prediction, item.frame)
+                        if item.calibration_phase:
+                            calibration_result = self._run_calibration_step(item, prediction)
+                            LOGGER.info(
+                                "[CALIBRATION_PHASE] frame=%s index=%d result=%s",
+                                item.frame.url,
+                                item.frame_index,
+                                calibration_result,
+                            )
+                        if not fallback:
+                            self.inference_circuit_breaker.record_success()
+                    except InferenceTimeoutError as exc:
+                        self.stats.increment("inference_errors")
+                        self.stats.increment("inference_timeouts")
+                        self.stats.increment("fallback_frames")
+                        fallback = True
+                        LOGGER.error("inference_timeout frame=%s error=%s", item.frame.url, exc)
+                        if self.degradation.force_degraded():
+                            LOGGER.warning(
+                                "degradation_mode changed=true reason=inference_timeout"
+                            )
+                        if self.inference_circuit_breaker.record_timeout():
+                            self.stats.increment("inference_circuit_breaker_trips")
+                            LOGGER.error(
+                                "inference_circuit_open cooldown_frames=%d trips=%d",
+                                self.settings.inference_circuit_breaker_cooldown_frames,
+                                self.inference_circuit_breaker.trip_count,
+                            )
+                        prediction = self._emergency_prediction(item.frame)
+                        outcome = InferenceOutcome(prediction, {})
+                    except InferenceWorkerError as exc:
+                        self.stats.increment("inference_errors")
+                        if exc.error_type == "CorruptFrameError":
+                            self.stats.increment("corrupt_frame_errors")
+                        self.stats.increment("fallback_frames")
+                        fallback = True
+                        LOGGER.error(
+                            "inference_worker_error frame=%s error=%s", item.frame.url, exc
                         )
+                        prediction = self._emergency_prediction(item.frame)
+                        prediction = self._apply_navigation_mode(item, prediction)
+                        outcome = InferenceOutcome(prediction, {})
                     except Exception as exc:
                         self.stats.increment("inference_errors")
+                        self.stats.increment("fallback_frames")
+                        fallback = True
                         LOGGER.exception(
                             "inference_fallback frame=%s error=%s", item.frame.url, exc
                         )
                         prediction = self._emergency_prediction(item.frame)
+                        prediction = self._apply_navigation_mode(item, prediction)
+                        outcome = InferenceOutcome(prediction, {})
                     inference_ms = (time.perf_counter() - started) * 1000
                     if degraded:
                         self.stats.increment("degraded_frames")
@@ -348,19 +695,28 @@ class ThreadedEdgePipeline:
                             self.degradation.degraded,
                             inference_ms,
                         )
-                    LOGGER.info(
-                        "inference frame=%s elapsed_ms=%.3f degraded=%s",
-                        item.frame.url,
-                        inference_ms,
-                        degraded,
-                    )
+                    timings = dict(item.timings_ms)
+                    timings.update(outcome.timings_ms)
+                    timings["inference_ms"] = inference_ms
                     result = ResultJob(
                         prediction,
                         item.frame.url,
-                        item.received_at,
-                        item.network_in_ms,
-                        inference_ms,
+                        item.frame_index,
+                        item.calibration_phase,
+                        _frame_modality(item.frame),
+                        item.cycle_started_at,
+                        timings,
                         degraded,
+                        fallback,
+                        item.network_counts,
+                    )
+                    LOGGER.info(
+                        "%s Frame processed frame=%s index=%d fallback=%s inference_ms=%.3f",
+                        "[CALIBRATION_PHASE]" if item.calibration_phase else "[INFERENCE_PHASE]",
+                        item.frame.url,
+                        item.frame_index,
+                        fallback,
+                        inference_ms,
                     )
                     if not self._put(self.output_queue, result):
                         return
@@ -386,7 +742,47 @@ class ThreadedEdgePipeline:
                         return
                     assert isinstance(item, ResultJob)
                     # Last line of defense immediately before network serialization.
+                    validation_started = time.perf_counter()
                     prediction = Prediction.model_validate(item.prediction.canonical_dict())
+                    validation_ms = (time.perf_counter() - validation_started) * 1000
+                    if item.calibration_phase:
+                        registration_prediction = self._calibration_registration_prediction(
+                            item,
+                            prediction,
+                        )
+                        while not self.stop_event.is_set():
+                            started = time.perf_counter()
+                            try:
+                                gateway.submit(registration_prediction)
+                            except RetryExhausted as exc:
+                                self.stats.increment("post_errors")
+                                LOGGER.warning(
+                                    "[CALIBRATION_PHASE] registration_retry frame=%s index=%d error=%s",
+                                    item.frame_url,
+                                    item.frame_index,
+                                    exc,
+                                )
+                                self._sleep_or_stop(self.settings.error_cooldown_seconds)
+                                continue
+                            except PermanentAPIError as exc:
+                                self._fatal(
+                                    f"permanent calibration registration error: {exc}"
+                                )
+                                return
+                            post_ms = (time.perf_counter() - started) * 1000
+                            self.stats.increment("frames_processed")
+                            self.stats.increment("calibration_frames")
+                            LOGGER.info(
+                                "[CALIBRATION_PHASE] frame=%s index=%d registration_only=true post_sent=true post_ms=%.3f next_expected_index=%d",
+                                item.frame_url,
+                                item.frame_index,
+                                post_ms,
+                                item.frame_index + 1,
+                            )
+                            if not self._put(self.ack_queue, FrameAck(item.frame_url)):
+                                return
+                            break
+                        continue
                     while not self.stop_event.is_set():
                         started = time.perf_counter()
                         try:
@@ -404,17 +800,69 @@ class ThreadedEdgePipeline:
                             self._fatal(f"permanent Network OUT error: {exc}")
                             return
                         post_ms = (time.perf_counter() - started) * 1000
-                        total_ms = (time.monotonic() - item.received_at) * 1000
+                        self.stats.increment("frames_processed")
+                        self.stats.increment("inference_frames")
+                        total_ms = (time.monotonic() - item.cycle_started_at) * 1000
                         count = self.stats.record_submission(
                             total_ms, self.settings.sla_seconds * 1000
                         )
-                        LOGGER.info(
-                            "network_out frame=%s post_ms=%.3f total_ms=%.3f count=%d",
-                            item.frame_url,
-                            post_ms,
-                            total_ms,
-                            count,
+                        timings = dict(item.timings_ms)
+                        timings.update(
+                            serialization_validation_ms=validation_ms,
+                            post_ms=post_ms,
+                            end_to_end_ms=total_ms,
                         )
+                        consumer_counts = _gateway_telemetry(gateway)
+                        self._record_network_counts(consumer_counts)
+                        timings["auth_ms"] = timings.get("auth_ms", 0.0) + consumer_counts.pop(
+                            "auth_ms", 0.0
+                        )
+                        network_counts = {
+                            key: int(item.network_counts.get(key, 0))
+                            + int(consumer_counts.get(key, 0))
+                            for key in (
+                                "retry_count",
+                                "http_401_count",
+                                "http_429_count",
+                                "http_5xx_count",
+                            )
+                        }
+                        self.metrics.record(
+                            FrameMetric(
+                                frame=item.frame_url,
+                                timings_ms=timings,
+                                fallback=item.fallback,
+                                retry_count=network_counts["retry_count"],
+                                http_401_count=network_counts["http_401_count"],
+                                http_429_count=network_counts["http_429_count"],
+                                http_5xx_count=network_counts["http_5xx_count"],
+                                model_restarts=(
+                                    self.watchdog.restart_count if self.watchdog else 0
+                                ),
+                                input_queue_depth=self.input_queue.qsize(),
+                                output_queue_depth=self.output_queue.qsize(),
+                                modality=item.modality,
+                                detected_object_count=len(prediction.detected_objects),
+                                active_reference_count=len(prediction.detected_undefined_objects),
+                                degraded_mode=item.degraded,
+                                rss_mb=current_rss_mb(),
+                            )
+                        )
+                        if count == 1 or count % self.settings.log_every == 0:
+                            LOGGER.info(
+                                "[INFERENCE_PHASE] frame_progress frame=%s index=%d count=%d post_ms=%.3f "
+                                "end_to_end_ms=%.3f fps=%.3f fallback=%s "
+                                "modality=%s objects=%d",
+                                item.frame_url,
+                                item.frame_index,
+                                count,
+                                post_ms,
+                                total_ms,
+                                self.stats.fps,
+                                item.fallback,
+                                item.modality,
+                                len(prediction.detected_objects),
+                            )
                         if not self._put(self.ack_queue, FrameAck(item.frame_url)):
                             return
                         break
@@ -432,25 +880,84 @@ class ThreadedEdgePipeline:
                 gateway.close()
 
     def _emergency_prediction(self, frame: FrameMetadata) -> Prediction:
-        try:
-            return self.inference.fallback(frame, self._absolute_user_url())
-        except Exception as exc:
-            LOGGER.exception("fallback_builder_failed frame=%s error=%s", frame.url, exc)
-            reference = frame.reference_translation or (0.0, 0.0, 0.0)
-            return Prediction(
-                id=PipelineInferenceEngine.prediction_id(frame.url),
-                user=self._absolute_user_url(),
-                frame=frame.url,
-                detected_objects=[],
-                detected_translations=[
-                    DetectedTranslation(
-                        translation_x=reference[0],
-                        translation_y=reference[1],
-                        translation_z=reference[2],
-                    )
-                ],
-                detected_undefined_objects=[],
+        self._ensure_safe_stream(frame)
+        reference = frame.reference_translation if frame.gps_health_status == 1 else None
+        if reference is not None:
+            position = reference
+            self._store_safe_position(position)
+        else:
+            position = self._extrapolate_safe_position()
+        return Prediction(
+            id=PipelineInferenceEngine.prediction_id(frame.url),
+            user=self._absolute_user_url(),
+            frame=frame.url,
+            detected_objects=[],
+            detected_translations=[
+                DetectedTranslation(
+                    translation_x=position[0],
+                    translation_y=position[1],
+                    translation_z=position[2],
+                )
+            ],
+            detected_undefined_objects=[],
+        )
+
+    def _remember_safe_position(
+        self,
+        prediction: Prediction,
+        frame: FrameMetadata,
+    ) -> None:
+        self._ensure_safe_stream(frame)
+        translation = prediction.detected_translations[0]
+        self._store_safe_position(
+            (
+            translation.translation_x,
+            translation.translation_y,
+            translation.translation_z,
             )
+        )
+
+    def _ensure_safe_stream(self, frame: FrameMetadata) -> None:
+        stream_key = (frame.session, frame.video_name)
+        if self._safe_stream_key == stream_key:
+            return
+        self._safe_stream_key = stream_key
+        self._last_safe_position = (0.0, 0.0, 0.0)
+        self._last_safe_delta = (0.0, 0.0, 0.0)
+        self._safe_position_initialized = False
+        self._parent_fallback_steps = 0
+
+    def _store_safe_position(self, position: tuple[float, float, float]) -> None:
+        if self._safe_position_initialized:
+            delta = tuple(
+                current - previous
+                for current, previous in zip(position, self._last_safe_position, strict=True)
+            )
+            norm = sum(value * value for value in delta) ** 0.5
+            if norm <= self.settings.vo_max_step_m:
+                self._last_safe_delta = tuple(
+                    0.75 * previous + 0.25 * current
+                    for previous, current in zip(self._last_safe_delta, delta, strict=True)
+                )
+        self._last_safe_position = position
+        self._safe_position_initialized = True
+        self._parent_fallback_steps = 0
+
+    def _extrapolate_safe_position(self) -> tuple[float, float, float]:
+        if not self._safe_position_initialized:
+            return self._last_safe_position
+        self._parent_fallback_steps += 1
+        decay = self.settings.vo_fallback_decay**self._parent_fallback_steps
+        delta = tuple(value * decay for value in self._last_safe_delta)
+        norm = sum(value * value for value in delta) ** 0.5
+        if norm < 1e-6 or norm > self.settings.vo_max_step_m:
+            return self._last_safe_position
+        self._last_safe_position = tuple(
+            position + movement
+            for position, movement in zip(self._last_safe_position, delta, strict=True)
+        )
+        self.stats.increment("position_extrapolation_fallbacks")
+        return self._last_safe_position
 
     def _absolute_user_url(self) -> str:
         return urljoin(f"{self.settings.base_url}/", self.settings.user_url)
@@ -480,7 +987,275 @@ class ThreadedEdgePipeline:
         if self.max_frames is None:
             return False
         with self.stats._lock:
-            return self.stats.frames_submitted >= self.max_frames
+            return self.stats.frames_processed >= self.max_frames
+
+    def _run_calibration_step(
+        self,
+        item: FrameJob,
+        prediction: Prediction,
+    ) -> dict[str, object]:
+        translation = item.frame.reference_translation
+        if translation is None:
+            return {"status": "skipped", "reason": "missing_ground_truth"}
+        detected = prediction.detected_translations[0]
+        detection_payload = {
+            "translation": (
+                detected.translation_x,
+                detected.translation_y,
+                detected.translation_z,
+            ),
+            "objects": len(prediction.detected_objects),
+        }
+        ground_truth_payload = {
+            "translation": translation,
+            "frame": item.frame.url,
+            "frame_index": item.frame_index,
+        }
+        result = HurgorVision.calibrate(ground_truth_payload, detection_payload)
+        return result or {"status": "skipped", "reason": "invalid_payload"}
+
+    def _simulate_gps_stream(self, frame: FrameMetadata, frame_index: int) -> FrameMetadata:
+        translation = frame.reference_translation
+        if frame_index >= self._gps_denied_frame:
+            self._gps_denied_mode = True
+            if not self._gps_denied_announced:
+                LOGGER.warning(
+                    "[NAV_MODE: GPS_DENIED] frame=%s index=%d trigger=%d",
+                    frame.url,
+                    frame_index,
+                    self._gps_denied_frame,
+                )
+                self._gps_denied_announced = True
+            return frame.model_copy(
+                update={
+                    "gps_health_status": 0,
+                    "translation_x": float("nan"),
+                    "translation_y": float("nan"),
+                    "translation_z": float("nan"),
+                }
+            )
+        if frame.gps_health_status == 1 and translation is not None and self._gps_noise_std_m > 0.0:
+            noisy = tuple(
+                value + self._rng.gauss(0.0, self._gps_noise_std_m)
+                for value in translation
+            )
+            return frame.model_copy(
+                update={
+                    "translation_x": noisy[0],
+                    "translation_y": noisy[1],
+                    "translation_z": noisy[2],
+                }
+            )
+        return frame
+
+    def _apply_navigation_mode(self, item: FrameJob, prediction: Prediction) -> Prediction:
+        if item.frame.gps_health_status == 1 and item.frame.reference_translation is not None:
+            self._gps_denied_mode = False
+            self._origin_locked = False
+            self._drift_score = max(0.0, self._drift_score - 0.25)
+            self._graceful_nav_degraded = False
+            self._record_map_point(item.frame_index, item.frame.reference_translation, "gps")
+            self._previous_gray_frame = self._decode_gray(item.image_bytes)
+            self._last_nav_timestamp = time.monotonic()
+            self._relative_position = item.frame.reference_translation
+            return prediction
+
+        now = time.monotonic()
+        dt = 1.0 / 30.0
+        if self._last_nav_timestamp is not None:
+            dt = max(1e-3, now - self._last_nav_timestamp)
+        self._last_nav_timestamp = now
+
+        if not self._origin_locked:
+            source = prediction.detected_translations[0]
+            origin_world = (
+                source.translation_x,
+                source.translation_y,
+                source.translation_z,
+            )
+            self._relative_position = (0.0, 0.0, 0.0)
+            self._relative_velocity = (0.0, 0.0, 0.0)
+            self._origin_locked = True
+            lock_result = HurgorVision.lock_origin(origin_world)
+            LOGGER.warning(
+                "[NAV_MODE: GPS_DENIED] origin_lock frame=%s index=%d world_origin=%s lock=%s",
+                item.frame.url,
+                item.frame_index,
+                origin_world,
+                lock_result,
+            )
+            self._record_map_point(item.frame_index, self._relative_position, "gps_denied")
+            self._previous_gray_frame = self._decode_gray(item.image_bytes)
+            return self._prediction_with_position(prediction, self._relative_position)
+
+        current_gray = self._decode_gray(item.image_bytes)
+        flow_vectors = np.empty((0, 2), dtype=np.float32)
+        nav_quality = 0.0
+        speed = 0.0
+
+        if (
+            not self._graceful_nav_degraded
+            and self._previous_gray_frame is not None
+            and current_gray is not None
+        ):
+            flow_vectors = HurgorVision.compute_optical_flow_vectors(
+                self._previous_gray_frame,
+                current_gray,
+            )
+            dr_result = HurgorVision.differential_position_estimate(
+                flow_vectors,
+                dt,
+                meters_per_pixel=_FLOW_METERS_PER_PIXEL,
+            )
+            velocity = dr_result["velocity"]
+            speed = float(dr_result["speed"])
+            nav_quality = float(dr_result["quality"])
+            self._relative_velocity = (
+                float(velocity[0]),
+                float(velocity[1]),
+                float(velocity[2]),
+            )
+        else:
+            self._relative_velocity = tuple(value * 0.95 for value in self._relative_velocity)
+            speed = math.sqrt(sum(value * value for value in self._relative_velocity))
+            nav_quality = 0.15 if self._graceful_nav_degraded else 0.0
+
+        self._relative_position = tuple(
+            position + velocity * dt
+            for position, velocity in zip(self._relative_position, self._relative_velocity, strict=True)
+        )
+
+        drift_penalty = 0.0
+        if nav_quality < 0.35:
+            drift_penalty += 1.25
+        if speed > _DRIFT_SPEED_ALERT_MPS:
+            drift_penalty += 1.5
+        if flow_vectors.shape[0] < 12:
+            drift_penalty += 0.75
+        self._drift_score = max(0.0, self._drift_score + drift_penalty - 0.35)
+
+        if self._drift_score >= _DRIFT_ALERT_SCORE and not self._graceful_nav_degraded:
+            self._graceful_nav_degraded = True
+            LOGGER.warning(
+                "[NAV_MODE: GPS_DENIED] graceful_degradation=true frame=%s index=%d drift_score=%.2f quality=%.3f speed=%.3f",
+                item.frame.url,
+                item.frame_index,
+                self._drift_score,
+                nav_quality,
+                speed,
+            )
+        elif self._drift_score <= _DRIFT_RECOVERY_SCORE and self._graceful_nav_degraded:
+            self._graceful_nav_degraded = False
+            LOGGER.info(
+                "[NAV_MODE: GPS_DENIED] graceful_degradation=false frame=%s index=%d drift_score=%.2f",
+                item.frame.url,
+                item.frame_index,
+                self._drift_score,
+            )
+
+        nav_mode = "gps_denied_degraded" if self._graceful_nav_degraded else "gps_denied"
+        self._record_map_point(item.frame_index, self._relative_position, nav_mode)
+        self._previous_gray_frame = current_gray
+        return self._prediction_with_position(prediction, self._relative_position)
+
+    @staticmethod
+    def _decode_gray(image_bytes: bytes) -> np.ndarray | None:
+        if not image_bytes:
+            return None
+        buffer = np.frombuffer(image_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(buffer, cv2.IMREAD_GRAYSCALE)
+        return frame
+
+    def _prediction_with_position(
+        self,
+        prediction: Prediction,
+        position: tuple[float, float, float],
+    ) -> Prediction:
+        translation = DetectedTranslation(
+            translation_x=float(position[0]),
+            translation_y=float(position[1]),
+            translation_z=float(position[2]),
+        )
+        payload = prediction.canonical_dict()
+        payload["detected_translations"] = [translation.model_dump(mode="json")]
+        return Prediction.model_validate(payload)
+
+    def _record_map_point(
+        self,
+        frame_index: int,
+        position: tuple[float, float, float],
+        nav_mode: str,
+    ) -> None:
+        point = {
+            "frame_index": int(frame_index),
+            "x": float(position[0]),
+            "y": float(position[1]),
+            "z": float(position[2]),
+            "nav_mode": nav_mode,
+            "timestamp": time.time(),
+        }
+        with self._map_lock:
+            self.map_data.append(point)
+
+    def _save_trajectory_map(self) -> None:
+        with self._map_lock:
+            if not self.map_data:
+                return
+            points = list(self.map_data)
+        xs = [float(point["x"]) for point in points]
+        ys = [float(point["y"]) for point in points]
+        zs = [float(point["z"]) for point in points]
+        summary = {
+            "point_count": len(points),
+            "gps_denied_trigger_frame": self._gps_denied_frame,
+            "drift_score": self._drift_score,
+            "graceful_degradation": self._graceful_nav_degraded,
+            "bounds": {
+                "x_min": min(xs),
+                "x_max": max(xs),
+                "y_min": min(ys),
+                "y_max": max(ys),
+                "z_min": min(zs),
+                "z_max": max(zs),
+            },
+        }
+        payload = {
+            "summary": summary,
+            "points": points,
+        }
+        with open(_TRAJECTORY_MAP_PATH, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=True, indent=2)
+        LOGGER.info(
+            "trajectory_map_saved path=%s points=%d",
+            _TRAJECTORY_MAP_PATH,
+            len(points),
+        )
+
+    def _calibration_registration_prediction(
+        self,
+        item: ResultJob,
+        prediction: Prediction,
+    ) -> Prediction:
+        source = prediction.detected_translations[0]
+        translation = (
+            source.translation_x,
+            source.translation_y,
+            source.translation_z,
+        )
+        return Prediction(
+            id=PipelineInferenceEngine.prediction_id(item.frame_url),
+            user=self._absolute_user_url(),
+            frame=item.frame_url,
+            detected_objects=[],
+            detected_translations=[
+                DetectedTranslation(
+                    translation_x=translation[0],
+                    translation_y=translation[1],
+                    translation_z=translation[2],
+                )
+            ],
+            detected_undefined_objects=[],
+        )
 
     def _put(self, target: queue.Queue, item: object) -> bool:
         while not self.stop_event.is_set():
@@ -501,7 +1276,68 @@ class ThreadedEdgePipeline:
     def _sleep_or_stop(self, seconds: float) -> None:
         self.stop_event.wait(timeout=seconds)
 
+    def _pace(self, cycle_started_at: float) -> None:
+        if self.settings.target_fps <= 0:
+            return
+        target_cycle_seconds = 1.0 / self.settings.target_fps
+        remaining = target_cycle_seconds - (time.monotonic() - cycle_started_at)
+        if remaining > 0:
+            self._sleep_or_stop(remaining)
+
+    def _record_network_counts(self, counts: dict[str, float]) -> None:
+        for name in ("retry_count", "http_401_count", "http_429_count", "http_5xx_count"):
+            value = int(counts.get(name, 0))
+            if value:
+                self.stats.increment(name, value)
+
     def _fatal(self, message: str) -> None:
         self.stats.set_fatal(message)
         LOGGER.error("fatal_pipeline error=%s", message)
         self.stop()
+
+
+def _gateway_telemetry(gateway: NetworkGateway) -> dict[str, float]:
+    take = getattr(gateway, "take_telemetry", None)
+    if take is None:
+        return {}
+    return dict(take())
+
+
+def main() -> None:
+    settings = ClientSettings.from_env()
+    configure_logging(log_file=settings.log_file)
+    pipeline = ThreadedEdgePipeline(settings)
+    stats = pipeline.run(max_frames=2250)
+    LOGGER.info(
+        "pipeline_finished processed=%d submitted=%d calibration=%d inference=%d elapsed_s=%.3f fps=%.2f fatal=%s",
+        stats.frames_processed,
+        stats.frames_submitted,
+        stats.calibration_frames,
+        stats.inference_frames,
+        stats.elapsed,
+        stats.fps,
+        stats.fatal_error,
+    )
+
+
+def _frame_index_from_url(frame_url: str) -> int:
+    normalized = frame_url.rstrip("/")
+    candidate = normalized.rsplit("/", 1)[-1]
+    try:
+        return int(candidate)
+    except ValueError:
+        return 10**9
+
+
+if __name__ == "__main__":
+    try:
+        print("--- [HURGOR] Pipeline başlatılıyor... ---")
+        main()
+    except Exception as e:
+        import traceback
+
+        print("\n" + "=" * 50)
+        print("!!! KRİTİK HATA OLUŞTU !!!")
+        print("=" * 50)
+        traceback.print_exc()
+        input("\n--- Program çöktü! Kapatmak için ENTER'a bas ---")

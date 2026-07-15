@@ -1,6 +1,9 @@
 paths:
-  dataset: dataset/data.yaml
-  models: models
+  dataset: "dataset/data.yaml"
+  models: "models"
+  calibrations_dir: "assets/calibrations/"
+  references_dir: "assets/references/"
+  telemetry_dir: "assets/telemetry/"
 
 training:
   batch: 8
@@ -11,7 +14,7 @@ training:
 inference:
   conf_threshold: 0.25
   iou_threshold: 0.7
-  device: 0
+  device: cpu
 
 hardware:
   model_type: yolo11s

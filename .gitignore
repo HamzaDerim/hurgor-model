@@ -1,4 +1,4 @@
-.venv/
+﻿.venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -12,8 +12,16 @@ logs/
 veriler/
 dataset/
 runs/
-models/*.pt
-models/*.engine
-.venv/
-__pycache__/
-*.pyc
+archive/
+artifacts/
+assets/
+diagnostics/
+models/
+*.pt
+*.engine
+*.onnx
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.csv

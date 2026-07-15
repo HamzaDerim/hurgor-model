@@ -1,23 +1,11 @@
-import logging
-import math
-from functools import lru_cache
-from typing import Any
-
-import cv2
 import numpy as np
 import pandas as pd
+import math
+import cv2
 from ultralytics import YOLO
-from .matcher import ReferenceMatcher
-
-
-LOGGER = logging.getLogger("hurgor.vision")
+from src.hurgor.matcher import ReferenceMatcher
 
 class HurgorVision:
-    _calibration_samples = 0
-    _translation_bias = (0.0, 0.0, 0.0)
-    _reference_point_world = (0.0, 0.0, 0.0)
-    _reference_point_locked = False
-
     def __init__(self, model_path="models/hurgor_final.onnx"):
         # 1. YOLO MODELİ ENTEGRASYONU (Yeni Eklendi)
         self.model = YOLO(model_path, task="detect")
@@ -38,129 +26,6 @@ class HurgorVision:
         self.K_inv = np.linalg.inv(self.K)
         self.dist_coeffs = np.array([-0.25, 0.05, 0.0, 0.0, 0.0], dtype=np.float32)
         self.telemetry_data = {}
-
-    @classmethod
-    def calibrate(cls, ground_truth, detection):
-        """Blend translation bias from early-frame ground-truth alignment."""
-        if not isinstance(ground_truth, dict) or not isinstance(detection, dict):
-            return None
-        gt = ground_truth.get("translation")
-        det = detection.get("translation")
-        if not isinstance(gt, (list, tuple)) or not isinstance(det, (list, tuple)):
-            return None
-        if len(gt) != 3 or len(det) != 3:
-            return None
-        try:
-            drift = tuple(float(gt[i]) - float(det[i]) for i in range(3))
-        except (TypeError, ValueError):
-            return None
-        alpha = 0.1
-        cls._translation_bias = tuple(
-            (1.0 - alpha) * previous + alpha * current
-            for previous, current in zip(cls._translation_bias, drift, strict=True)
-        )
-        cls._calibration_samples += 1
-        return {
-            "samples": cls._calibration_samples,
-            "translation_bias": cls._translation_bias,
-        }
-
-    @classmethod
-    def lock_origin(cls, world_position: tuple[float, float, float]) -> dict[str, Any] | None:
-        try:
-            origin = tuple(float(value) for value in world_position)
-        except (TypeError, ValueError):
-            return None
-        if len(origin) != 3 or not all(math.isfinite(value) for value in origin):
-            return None
-        cls._reference_point_world = origin
-        cls._reference_point_locked = True
-        return {
-            "reference_point_world": origin,
-            "locked": True,
-        }
-
-    @classmethod
-    def reference_point(cls) -> tuple[float, float, float] | None:
-        if not cls._reference_point_locked:
-            return None
-        return cls._reference_point_world
-
-    @staticmethod
-    def compute_optical_flow_vectors(
-        previous_gray: np.ndarray,
-        current_gray: np.ndarray,
-    ) -> np.ndarray:
-        if previous_gray is None or current_gray is None:
-            return np.empty((0, 2), dtype=np.float32)
-        previous_points = cv2.goodFeaturesToTrack(
-            previous_gray,
-            maxCorners=350,
-            qualityLevel=0.01,
-            minDistance=8,
-            blockSize=7,
-        )
-        if previous_points is None or len(previous_points) == 0:
-            return np.empty((0, 2), dtype=np.float32)
-        next_points, status, _ = cv2.calcOpticalFlowPyrLK(
-            previous_gray,
-            current_gray,
-            previous_points,
-            None,
-            winSize=(21, 21),
-            maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-        )
-        if next_points is None or status is None:
-            return np.empty((0, 2), dtype=np.float32)
-        valid = status.reshape(-1) == 1
-        if not np.any(valid):
-            return np.empty((0, 2), dtype=np.float32)
-        vectors = (next_points[valid] - previous_points[valid]).reshape(-1, 2)
-        return vectors.astype(np.float32)
-
-    @staticmethod
-    def differential_position_estimate(
-        optical_flow_vectors: np.ndarray,
-        dt: float,
-        *,
-        meters_per_pixel: float = 0.04,
-    ) -> dict[str, Any]:
-        if dt <= 0.0:
-            dt = 1.0 / 30.0
-        flow = np.asarray(optical_flow_vectors, dtype=np.float32)
-        if flow.ndim != 2 or flow.shape[1] != 2 or len(flow) == 0:
-            return {
-                "distance": 0.0,
-                "velocity": (0.0, 0.0, 0.0),
-                "speed": 0.0,
-                "quality": 0.0,
-                "samples": 0,
-            }
-        median = np.median(flow, axis=0)
-        spread = np.maximum(np.std(flow, axis=0), 1e-6)
-        inlier_mask = (
-            (np.abs(flow[:, 0] - median[0]) <= 2.5 * spread[0])
-            & (np.abs(flow[:, 1] - median[1]) <= 2.5 * spread[1])
-        )
-        inliers = flow[inlier_mask]
-        if len(inliers) == 0:
-            inliers = flow
-        translation_px = np.median(inliers, axis=0)
-        dx = float(translation_px[0] * meters_per_pixel)
-        dy = float(translation_px[1] * meters_per_pixel)
-        distance = math.hypot(dx, dy)
-        vx = dx / dt
-        vy = dy / dt
-        speed = math.hypot(vx, vy)
-        quality = min(1.0, float(len(inliers)) / float(max(1, len(flow))))
-        return {
-            "distance": distance,
-            "velocity": (vx, vy, 0.0),
-            "speed": speed,
-            "quality": quality,
-            "samples": int(len(inliers)),
-        }
 
     def load_telemetry(self, csv_path):
         # (MEVCUT KOD - KORUNDU)
@@ -272,12 +137,6 @@ class HurgorVision:
             detections.append(ref_detection)
                 
         return detections
-
-
-@lru_cache(maxsize=None)
-def get_shared_vision(model_path: str = "models/hurgor_final.onnx") -> HurgorVision:
-    LOGGER.info("Loading %s", model_path)
-    return HurgorVision(model_path=model_path)
 
 
 # MEVCUT SINIFLAR - TAMAMEN KORUNDU
