@@ -25,3 +25,4 @@ models/
 *.jpg
 *.jpeg
 *.csv
+trajectory_map.json

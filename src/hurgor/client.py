@@ -217,10 +217,15 @@ class CompetitionAPI:
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         last_error: Exception | None = None
+        last_error_text = "unknown error"
         refreshed = False
         total_attempts = self.settings.max_retries + 1 + int(self.auth_manager is not None)
         for attempt in range(total_attempts):
             try:
+                kwargs.setdefault(
+                    "timeout",
+                    httpx.Timeout(max(5.0, float(self.settings.http_timeout_seconds))),
+                )
                 response = await self.client.request(method, url, **kwargs)
                 self.status_counts[response.status_code] = (
                     self.status_counts.get(response.status_code, 0) + 1
@@ -251,6 +256,7 @@ class CompetitionAPI:
                 return response
             except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
                 last_error = exc
+                last_error_text = repr(exc) or str(exc) or type(exc).__name__
                 retryable = not isinstance(exc, httpx.HTTPStatusError) or (
                     exc.response.status_code >= 500 or exc.response.status_code in {408, 425, 429}
                 )
@@ -267,7 +273,7 @@ class CompetitionAPI:
                     min(attempt, len(backoff_schedule) - 1)
                 ]
                 await asyncio.sleep(delay)
-        raise RetryExhausted(f"{method} {url} failed: {last_error}") from last_error
+            raise RetryExhausted(f"{method} {url} failed: {last_error_text}") from last_error
 
     def _write_contract_diagnostic(self, prediction: Prediction, error: str) -> None:
         directory = Path(self.settings.diagnostics_dir).expanduser()

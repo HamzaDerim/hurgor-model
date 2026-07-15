@@ -10,7 +10,10 @@ from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Local test runs frequently reuse terminals where stale environment variables
+# survive between commands. Force .env to be the source of truth unless the
+# caller intentionally rewrites variables after startup.
+load_dotenv(override=True)
 
 
 @dataclass(frozen=True, slots=True)

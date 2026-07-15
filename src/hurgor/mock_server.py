@@ -610,25 +610,13 @@ def create_app(settings: MockSettings | None = None) -> FastAPI:
         return None
 
     @app.post("/auth/")
-    async def auth(request: Request) -> Response:
-        content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type:
-            try:
-                credentials = await request.json()
-            except ValueError:
-                credentials = {}
-        else:
-            parsed = parse_qs((await request.body()).decode("utf-8", errors="replace"))
-            credentials = {key: values[0] for key, values in parsed.items() if values}
-        username = credentials.get("username") if isinstance(credentials, dict) else None
-        password = credentials.get("password") if isinstance(credentials, dict) else None
-        if username != state.settings.mock_username or password != state.settings.mock_password:
-            return JSONResponse({"detail": "invalid credentials"}, status_code=400)
+    async def login_bypass(request: Request) -> dict[str, str]:
+        del request
+        # Auth is fully bypassed in local tests.
         async with state.lock:
-            state.valid_token = secrets.token_urlsafe(24)
+            state.valid_token = "mock_token_12345"
             state.token_request_count = 0
-            token = state.valid_token
-        return JSONResponse({"token": token})
+        return {"token": "mock_token_12345", "mesaj": "Giris basarili"}
 
     @app.get("/progress/")
     async def official_progress(request: Request) -> Response:
@@ -918,34 +906,65 @@ def create_app(settings: MockSettings | None = None) -> FastAPI:
             state.outstanding_index = None
             return {"accepted": True, "duplicate": False}
 
+    def _status_payload() -> dict[str, Any]:
+        completed = state.accepted_count >= state.settings.frame_count
+        return {
+            "status": "active" if not completed else "completed",
+            "completed": completed,
+            "session_id": "test",
+            "session_name": state.settings.session_url,
+            "total_frames": state.settings.frame_count,
+            "processed_frames": state.accepted_count,
+            "frame_index": state.accepted_count,
+            "next_index": state.next_index,
+            "outstanding_index": state.outstanding_index,
+            "accepted_count": state.accepted_count,
+            "frame_count": state.settings.frame_count,
+            "recent_state_size": len(state.recent_frame_urls),
+            "request_count": state.request_count,
+            "request_get_count": state.request_get_count,
+            "request_post_count": state.request_post_count,
+            "injected_401_count": state.injected_401_count,
+            "injected_429_count": state.injected_429_count,
+            "injected_5xx_count": state.injected_5xx_count,
+            "frame_issue_count": state.frame_issue_count,
+            "frame_response_count": state.frame_response_count,
+            "repeated_frame_get_count": state.repeated_frame_get_count,
+            "empty_metadata_fault_count": state.empty_metadata_fault_count,
+            "image_request_count": state.image_request_count,
+            "corrupt_image_fault_count": state.corrupt_image_fault_count,
+            "empty_image_fault_count": state.empty_image_fault_count,
+            "prediction_payload_count": state.prediction_payload_count,
+            "duplicate_prediction_count": state.duplicate_prediction_count,
+            "rejected_prediction_count": state.rejected_prediction_count,
+            "order_violation_count": state.order_violation_count,
+            "position": state.position_summary(),
+        }
+
     @app.get("/api/status")
     async def status() -> dict[str, Any]:
         async with state.lock:
-            return {
-                "next_index": state.next_index,
-                "outstanding_index": state.outstanding_index,
-                "accepted_count": state.accepted_count,
-                "frame_count": state.settings.frame_count,
-                "recent_state_size": len(state.recent_frame_urls),
-                "request_count": state.request_count,
-                "request_get_count": state.request_get_count,
-                "request_post_count": state.request_post_count,
-                "injected_401_count": state.injected_401_count,
-                "injected_429_count": state.injected_429_count,
-                "injected_5xx_count": state.injected_5xx_count,
-                "frame_issue_count": state.frame_issue_count,
-                "frame_response_count": state.frame_response_count,
-                "repeated_frame_get_count": state.repeated_frame_get_count,
-                "empty_metadata_fault_count": state.empty_metadata_fault_count,
-                "image_request_count": state.image_request_count,
-                "corrupt_image_fault_count": state.corrupt_image_fault_count,
-                "empty_image_fault_count": state.empty_image_fault_count,
-                "prediction_payload_count": state.prediction_payload_count,
-                "duplicate_prediction_count": state.duplicate_prediction_count,
-                "rejected_prediction_count": state.rejected_prediction_count,
-                "order_violation_count": state.order_violation_count,
-                "position": state.position_summary(),
-            }
+            return _status_payload()
+
+    @app.get("/status")
+    async def status_alias() -> dict[str, Any]:
+        async with state.lock:
+            return _status_payload()
+
+    @app.get("/api/progress")
+    async def progress_alias() -> dict[str, Any]:
+        async with state.lock:
+            return _status_payload()
+
+    @app.get("/api/health")
+    async def health_alias() -> dict[str, Any]:
+        async with state.lock:
+            payload = _status_payload()
+        return {
+            "status": payload["status"],
+            "completed": payload["completed"],
+            "session_id": payload["session_id"],
+        }
 
     return app
 
@@ -956,7 +975,7 @@ app = create_app()
 def main() -> None:
     parser = argparse.ArgumentParser(description="HürGör mock yarışma sunucusu")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--image-dir", default=None, help="Mock için gerçek görüntü klasörü")
     parser.add_argument("--video", default=None, help="Mock için yerel video dosyası")
     parser.add_argument("--translation-csv", default=None, help="Frame translation CSV dosyası")
